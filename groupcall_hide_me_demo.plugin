@@ -1,34 +1,19 @@
 __id__ = "groupcall_hide_me_demo"
 __name__ = "GroupCall Ghost (demo)"
 __description__ = "Демо бага: пытается выписать тебя из реестра участников видеочата, не разрывая аудио. Команды в любом чате: .ghost / .unghost"
-__author__ = "LakendraHekmat"
-__version__ = "2.0.0"
-__min_version__ = "11.12.0"
+__author__ = "realmaximg"
+__version__ = "2.1.0"
 __icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.5.1"
 
 from base_plugin import BasePlugin, MethodHook, HookResult, HookStrategy
-from hook_utils import find_class
+from hook_utils import find_class, get_private_field
 from client_utils import send_request
-from android_utils import log, run_on_ui_thread
+from android_utils import run_on_ui_thread
 from java.lang import Boolean, Integer
-
-TLRPC = "org.telegram.tgnet.TLRPC$"
-
-
-def _field(obj, name):
-    f = obj.getClass().getDeclaredField(name)
-    f.setAccessible(True)
-    return f.get(obj)
-
-
-def _call_private(obj, name, types=(), args=()):
-    m = obj.getClass().getDeclaredMethod(name, *types)
-    m.setAccessible(True)
-    return m.invoke(obj, *args)
-
-
-def _service():
-    return find_class("org.telegram.messenger.voip.VoIPService").getSharedInstance()
+from java import jint
+from org.telegram.tgnet import TLRPC
+from org.telegram.messenger.voip import VoIPService
 
 
 class _BlockWhenGhost(MethodHook):
@@ -44,68 +29,82 @@ class _BlockWhenGhost(MethodHook):
 class GhostDemo(BasePlugin):
     def on_plugin_load(self):
         self.ghost = False
+        # команды регистрируем первыми — чтобы работали, даже если хуки не встанут
+        self.add_on_send_message_hook()
         try:
-            VoIP = find_class("org.telegram.messenger.voip.VoIPService").getClass()
-            # шортпол checkGroupCall: увидит «пропажу» и пересоздаст инстанс
-            self.hook_method(VoIP.getDeclaredMethod("startGroupCheckShortpoll"), _BlockWhenGhost(self))
-            # любой автоперезаход (GROUPCALL_JOIN_MISSING и т.п.)
-            self.hook_method(VoIP.getDeclaredMethod("createGroupInstance", Integer.TYPE, Boolean.TYPE), _BlockWhenGhost(self))
-            self.add_on_send_message_hook()
-            log("[Ghost] loaded")
+            cls = find_class("org.telegram.messenger.voip.VoIPService")
+            m1 = cls.getDeclaredMethod("startGroupCheckShortpoll")
+            m1.setAccessible(True)
+            self.hook_method(m1, _BlockWhenGhost(self))
+            m2 = cls.getDeclaredMethod("createGroupInstance", Integer.TYPE, Boolean.TYPE)
+            m2.setAccessible(True)
+            self.hook_method(m2, _BlockWhenGhost(self))
+            self.logger.info("loaded, hooks ok")
         except Exception as e:
-            log(f"[Ghost] load failed: {e}")
+            self.logger.error(f"hook failed: {e}")
 
-    # ---------- команды ----------
     def on_send_message_hook(self, account, params):
-        text = (getattr(params, "message", None) or "").strip().lower()
-        if text == ".ghost":
+        text = getattr(params, "message", None)
+        if not isinstance(text, str):
+            return HookResult()
+        cmd = text.strip().lower()
+        if cmd == ".ghost":
             run_on_ui_thread(self._go_ghost)
-        elif text == ".unghost":
+        elif cmd == ".unghost":
             run_on_ui_thread(self._unghost)
         else:
             return HookResult()
         return HookResult(strategy=HookStrategy.CANCEL)
 
-    # ---------- логика ----------
+    def _toast(self, text):
+        try:
+            from ui.bulletin import BulletinHelper
+            BulletinHelper.show_info(text)
+        except Exception:
+            pass
+        self.logger.info(text)
+
     def _go_ghost(self):
-        svc = _service()
+        svc = VoIPService.getSharedInstance()
         if svc is None or svc.groupCall is None:
-            log("[Ghost] not in a group call")
+            self._toast("Ghost: ты не в видеочате")
             return
         try:
-            my_source = _field(svc, "mySource")[0]
+            my_source = get_private_field(svc, "mySource")[0]
             if my_source == 0:
-                log("[Ghost] not joined yet (no ssrc)")
+                self._toast("Ghost: ещё не подключился (нет ssrc)")
                 return
             self.ghost = True
-            _call_private(svc, "cancelGroupCheckShortPoll")
+            cancel = find_class("org.telegram.messenger.voip.VoIPService").getDeclaredMethod("cancelGroupCheckShortPoll")
+            cancel.setAccessible(True)
+            cancel.invoke(svc)
 
-            # Сервер получает «вышел», а медиа-инстанс (tgVoip) остаётся живым.
-            req = find_class(TLRPC + "TL_phone_leaveGroupCall")()
+            req = TLRPC.TL_phone_leaveGroupCall()
             req.call = svc.groupCall.getInputGroupCall()
             req.source = my_source
 
             def done(resp, err):
                 if resp is not None:
-                    # обновления не применяем: иначе свой клиент тоже уберёт тебя и пересинхронится
-                    log(f"[Ghost] left registry, ssrc {my_source} kept alive")
+                    run_on_ui_thread(lambda: self._toast(f"Ghost: вышел из реестра, ssrc {my_source} жив"))
                 else:
-                    log(f"[Ghost] leave failed: {err.text if err else '?'}")
                     self.ghost = False
+                    msg = err.text if err is not None else "?"
+                    run_on_ui_thread(lambda: self._toast(f"Ghost: ошибка {msg}"))
 
             send_request(req, done)
         except Exception as e:
             self.ghost = False
-            log(f"[Ghost] error: {e}")
+            self._toast(f"Ghost: ошибка {e}")
 
     def _unghost(self):
         self.ghost = False
-        svc = _service()
+        svc = VoIPService.getSharedInstance()
         if svc is None:
             return
         try:
-            # штатный перезаход: новый инстанс -> phone.joinGroupCall
-            _call_private(svc, "createGroupInstance", (Integer.TYPE, Boolean.TYPE), (Integer(0), Boolean(False)))
-            log("[Ghost] rejoined")
+            m = find_class("org.telegram.messenger.voip.VoIPService").getDeclaredMethod("createGroupInstance", Integer.TYPE, Boolean.TYPE)
+            m.setAccessible(True)
+            m.invoke(svc, Integer(0), Boolean(False))
+            self._toast("Ghost: перезашёл")
         except Exception as e:
-            log(f"[Ghost] rejoin failed: {e}")
+            self._toast(f"Ghost: перезаход не удался {e}")
