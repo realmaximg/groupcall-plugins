@@ -2,9 +2,8 @@ __id__ = "groupcall_hide_me_demo"
 __name__ = "GroupCall Ghost (demo)"
 __description__ = "Демо бага: пытается выписать тебя из реестра участников видеочата, не разрывая аудио. Команды в любом чате: .ghost / .unghost"
 __author__ = "realmaximg"
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 __icon__ = "exteraPlugins/1"
-__app_version__ = ">=12.5.1"
 
 from base_plugin import BasePlugin, MethodHook, HookResult, HookStrategy
 from hook_utils import find_class, get_private_field
@@ -14,6 +13,16 @@ from java.lang import Boolean, Integer
 from java import jint
 from org.telegram.tgnet import TLRPC
 from org.telegram.messenger.voip import VoIPService
+from org.telegram.messenger import ApplicationLoader
+from java.lang import Class as JClass
+
+
+def jcls(name):
+    """java.lang.Class, независимо от того, что возвращает find_class в этой сборке."""
+    c = find_class(name)
+    if c is not None and hasattr(c, "getDeclaredMethod"):
+        return c
+    return JClass.forName(name, True, ApplicationLoader.applicationContext.getClassLoader())
 
 
 class _BlockWhenGhost(MethodHook):
@@ -32,7 +41,7 @@ class GhostDemo(BasePlugin):
         # команды регистрируем первыми — чтобы работали, даже если хуки не встанут
         self.add_on_send_message_hook()
         try:
-            cls = find_class("org.telegram.messenger.voip.VoIPService")
+            cls = jcls("org.telegram.messenger.voip.VoIPService")
             m1 = cls.getDeclaredMethod("startGroupCheckShortpoll")
             m1.setAccessible(True)
             self.hook_method(m1, _BlockWhenGhost(self))
@@ -75,7 +84,7 @@ class GhostDemo(BasePlugin):
                 self._toast("Ghost: ещё не подключился (нет ssrc)")
                 return
             self.ghost = True
-            cancel = find_class("org.telegram.messenger.voip.VoIPService").getDeclaredMethod("cancelGroupCheckShortPoll")
+            cancel = jcls("org.telegram.messenger.voip.VoIPService").getDeclaredMethod("cancelGroupCheckShortPoll")
             cancel.setAccessible(True)
             cancel.invoke(svc)
 
@@ -102,7 +111,7 @@ class GhostDemo(BasePlugin):
         if svc is None:
             return
         try:
-            m = find_class("org.telegram.messenger.voip.VoIPService").getDeclaredMethod("createGroupInstance", Integer.TYPE, Boolean.TYPE)
+            m = jcls("org.telegram.messenger.voip.VoIPService").getDeclaredMethod("createGroupInstance", Integer.TYPE, Boolean.TYPE)
             m.setAccessible(True)
             m.invoke(svc, Integer(0), Boolean(False))
             self._toast("Ghost: перезашёл")
