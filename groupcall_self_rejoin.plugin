@@ -1,0 +1,128 @@
+__id__ = "groupcall_self_rejoin"
+__name__ = "GroupCall Self Rejoin"
+__description__ = "Проверяет, числишься ли ты у сервера в видеочате. Если сервер тебя потерял (звук идёт, а в списке тебя нет, перезашедшие не слышат) — тихо перезаходит."
+__author__ = "LakendraHekmat"
+__version__ = "1.0.0"
+__min_version__ = "11.12.0"
+__icon__ = "exteraPlugins/1"
+
+import threading
+import time
+
+from base_plugin import BasePlugin
+from hook_utils import find_class
+from client_utils import send_request
+from android_utils import log, run_on_ui_thread
+from java.lang import Boolean, Integer
+
+CHECK_INTERVAL = 8          # сек между проверками
+MISSES_TO_REJOIN = 2        # сколько промахов подряд до перезахода
+REJOIN_COOLDOWN = 30        # сек между перезаходами
+
+
+def _field(obj, name):
+    f = obj.getClass().getDeclaredField(name)
+    f.setAccessible(True)
+    return f.get(obj)
+
+
+class SelfRejoin(BasePlugin):
+    def on_plugin_load(self):
+        self._stop = False
+        self._misses = 0
+        self._last_rejoin = 0
+        self._busy = False
+        self._t = threading.Thread(target=self._loop, daemon=True)
+        self._t.start()
+        log("[SelfRejoin] started")
+
+    def on_plugin_unload(self):
+        self._stop = True
+
+    # ---------- loop ----------
+    def _loop(self):
+        while not self._stop:
+            time.sleep(CHECK_INTERVAL)
+            try:
+                run_on_ui_thread(self._check)
+            except Exception as e:
+                log(f"[SelfRejoin] loop error: {e}")
+
+    def _service(self):
+        VoIP = find_class("org.telegram.messenger.voip.VoIPService")
+        return VoIP.getSharedInstance()
+
+    def _check(self):
+        if self._busy:
+            return
+        svc = self._service()
+        if svc is None:
+            self._misses = 0
+            return
+        try:
+            call = _field(svc, "groupCall")
+            if call is None or call.call is None or call.isScheduled() or call.call.rtmp_stream:
+                return
+            # ждём, пока реально подключились
+            if svc.getCallState() != find_class("org.telegram.messenger.voip.VoIPService").STATE_ESTABLISHED:
+                return
+
+            TLRPC = "org.telegram.tgnet.TLRPC$"
+            req = find_class(TLRPC + "TL_phone_getGroupParticipants")()
+            req.call = call.getInputGroupCall()
+            req.offset = ""
+            req.limit = 1
+
+            peer = _field(svc, "groupCallPeer")
+            if peer is None:
+                peer = find_class(TLRPC + "TL_inputPeerUser")()
+                peer.user_id = call.currentAccount.getUserConfig().getClientUserId()
+            req.ids.add(peer)
+
+            if call.selfPeer is not None:
+                self_id = find_class("org.telegram.messenger.MessageObject").getPeerId(call.selfPeer)
+            else:
+                self_id = call.currentAccount.getUserConfig().getClientUserId()
+
+            self._busy = True
+            send_request(req, lambda resp, err: run_on_ui_thread(lambda: self._on_resp(resp, err, self_id)))
+        except Exception as e:
+            self._busy = False
+            log(f"[SelfRejoin] check error: {e}")
+
+    def _on_resp(self, resp, err, self_id):
+        self._busy = False
+        if resp is None:
+            return  # сетевая ошибка — не считаем промахом
+        try:
+            MO = find_class("org.telegram.messenger.MessageObject")
+            found = False
+            parts = resp.participants
+            for i in range(parts.size()):
+                p = parts.get(i)
+                if MO.getPeerId(p.peer) == self_id and not p.left:
+                    found = True
+                    break
+            if found:
+                self._misses = 0
+                return
+            self._misses += 1
+            log(f"[SelfRejoin] server doesn't list me ({self._misses}/{MISSES_TO_REJOIN})")
+            if self._misses >= MISSES_TO_REJOIN and time.time() - self._last_rejoin > REJOIN_COOLDOWN:
+                self._rejoin()
+        except Exception as e:
+            log(f"[SelfRejoin] resp error: {e}")
+
+    def _rejoin(self):
+        svc = self._service()
+        if svc is None:
+            return
+        try:
+            m = svc.getClass().getDeclaredMethod("createGroupInstance", Integer.TYPE, Boolean.TYPE)
+            m.setAccessible(True)
+            m.invoke(svc, Integer(0), Boolean(False))   # 0 = CAPTURE_DEVICE_CAMERA (основной аудио/видео инстанс)
+            self._last_rejoin = time.time()
+            self._misses = 0
+            log("[SelfRejoin] rejoined")
+        except Exception as e:
+            log(f"[SelfRejoin] rejoin failed: {e}")

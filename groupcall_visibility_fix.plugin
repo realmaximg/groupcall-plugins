@@ -1,0 +1,71 @@
+__id__ = "groupcall_visibility_fix"
+__name__ = "GroupCall Visibility Fix"
+__description__ = "Показывает в списке видеочата участников, которые зашли «тихо» и потом стали активны (фикс ChatObject.Call.processParticipantsUpdate)"
+__author__ = "LakendraHekmat"
+__version__ = "1.0.0"
+__min_version__ = "11.12.0"
+__icon__ = "exteraPlugins/1"
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from java.lang import Boolean
+from android_utils import log
+
+
+def _is_active(p, self_id, end_reached):
+    try:
+        pid = _peer_id(p.peer)
+    except Exception:
+        return False
+    return (pid == self_id or not p.muted or p.can_self_unmute or p.active_date != 0
+            or p.raise_hand_rating != 0 or end_reached)
+
+
+def _peer_id(peer):
+    MessageObject = find_class("org.telegram.messenger.MessageObject")
+    return MessageObject.getPeerId(peer)
+
+
+class _AfterUpdateHook(MethodHook):
+    def after_hooked_method(self, param):
+        try:
+            call = param.thisObject
+            participants = call.participants        # LongSparseArray
+            sorted_list = call.sortedParticipants   # ArrayList
+            end_reached = bool(call.membersLoadEndReached)
+
+            self_peer = call.selfPeer
+            if self_peer is not None:
+                self_id = _peer_id(self_peer)
+            else:
+                self_id = call.currentAccount.getUserConfig().getClientUserId()
+
+            added = 0
+            for i in range(participants.size()):
+                p = participants.valueAt(i)
+                if p is None or sorted_list.contains(p):
+                    continue
+                if _is_active(p, self_id, end_reached):
+                    sorted_list.add(p)
+                    added += 1
+
+            if added:
+                call.sortParticipants()
+                NC = find_class("org.telegram.messenger.NotificationCenter")
+                call.currentAccount.getNotificationCenter().postNotificationName(
+                    NC.groupCallUpdated, call.chatId, call.call.id, False)
+                log(f"[GroupCallFix] restored {added} hidden participant(s)")
+        except Exception as e:
+            log(f"[GroupCallFix] error: {e}")
+
+
+class GroupCallVisibilityFix(BasePlugin):
+    def on_plugin_load(self):
+        try:
+            CallCls = find_class("org.telegram.messenger.ChatObject$Call").getClass()
+            UpdCls = find_class("org.telegram.tgnet.TLRPC$TL_updateGroupCallParticipants").getClass()
+            method = CallCls.getDeclaredMethod("processParticipantsUpdate", UpdCls, Boolean.TYPE)
+            self.hook_method(method, _AfterUpdateHook())
+            log("[GroupCallFix] hooked processParticipantsUpdate")
+        except Exception as e:
+            log(f"[GroupCallFix] hook failed: {e}")
